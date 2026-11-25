@@ -5,6 +5,8 @@ import {LatLng} from '../../geo/LatLng.js';
 import {LatLngBounds} from '../../geo/LatLngBounds.js';
 import {Bounds} from '../../geometry/Bounds.js';
 import {Point} from '../../geometry/Point.js';
+import {CRS} from '../../geo/crs/CRS.js';
+import {Transformation} from '../../geometry/Transformation.js';
 import {latLngsToCoords, getFeature} from '../GeoJSONUtil.js';
 
 /** @import {Feature, Geometry, LineString, MultiLineString} from 'geojson' */
@@ -213,6 +215,8 @@ export class Polyline extends Path {
 
 	_project() {
 		const pxBounds = new Bounds();
+		/** @type {Point[][] | undefined} */
+		this._lastRings = this._rings;
 		/** @type {Point[][]} */
 		this._rings = [];
 		this._projectLatlngs(this._latlngs, this._rings, pxBounds);
@@ -246,12 +250,86 @@ export class Polyline extends Path {
 	 */
 	_projectLatlngs(latlngs, result, projectedBounds) {
 		if (LineUtil.isFlat(latlngs)) {
-			const ring = latlngs.map(latlng => this._renderer._latLngToLayerPoint(latlng));
-			ring.forEach(r => projectedBounds.extend(r));
-			result.push(ring);
+			result.push(this._projectRing(latlngs, result.length, projectedBounds));
 		} else {
 			latlngs.forEach(latlng => this._projectLatlngs(latlng, result, projectedBounds));
 		}
+	}
+
+	// The layer points of the k-th ring. The CRS's projection, the costly part, does not depend on the zoom: its result
+	// is kept for each point, with the coordinates it came from, so that a zoom only scales and offsets it.
+	/**
+	 * @param {LatLng[]} latlngs
+	 * @param {number} k
+	 * @param {Bounds} projectedBounds extended with the ring's points
+	 * @returns {Point[]}
+	 */
+	_projectRing(latlngs, k, projectedBounds) {
+		const renderer = this._renderer,
+		crs = this._map.options.crs,
+		t = crs.transformation;
+
+		// a CRS that projects otherwise
+		if (crs.latLngToPoint !== CRS.latLngToPoint || t._transform !== Transformation.prototype._transform) {
+			const ring = latlngs.map(latlng => renderer._latLngToLayerPoint(latlng));
+			ring.forEach(r => projectedBounds.extend(r));
+			return ring;
+		}
+		if (this._projectedCrs !== crs) {
+			/** @type {typeof CRS | undefined} */
+			this._projectedCrs = crs;
+			/** @type {Float64Array[]} */
+			this._projected = [];
+		}
+
+		const len = latlngs.length;
+		let cache = this._projected[k];
+		const fresh = cache?.length !== 4 * len;
+		if (fresh) {
+			cache = this._projected[k] = new Float64Array(4 * len);
+		}
+
+		const scale = crs.scale(renderer._pathZoom),
+		origin = renderer._pathOrigin,
+		// the points of the last projection are moved rather than made again: a million new points cost more than
+		// projecting them
+		last = this._lastRings?.[k],
+		reuse = last?.length === len,
+		ring = reuse ? last : new Array(len);
+		let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+
+		for (let i = 0; i < len; i++) {
+			const latlng = latlngs[i], j = 4 * i;
+			let p;
+			// new, or changed in place since
+			if (fresh || cache[j] !== latlng.lat || cache[j + 1] !== latlng.lng) {
+				p = crs.projection.project(latlng);
+				cache[j] = latlng.lat;
+				cache[j + 1] = latlng.lng;
+				cache[j + 2] = p.x;
+				cache[j + 3] = p.y;
+			}
+			// as crs.latLngToPoint and the renderer's offset
+			const x = scale * (t._a * cache[j + 2] + t._b) - origin.x,
+			y = scale * (t._c * cache[j + 3] + t._d) - origin.y;
+			if (reuse) {
+				p = ring[i];
+			} else {
+				p ??= new Point(0, 0);
+				ring[i] = p;
+			}
+			p.x = x;
+			p.y = y;
+			minX = Math.min(minX, x);
+			minY = Math.min(minY, y);
+			maxX = Math.max(maxX, x);
+			maxY = Math.max(maxY, y);
+		}
+		if (len) {
+			projectedBounds.extend(new Point(minX, minY));
+			projectedBounds.extend(new Point(maxX, maxY));
+		}
+		return ring;
 	}
 
 	// clip polyline by renderer bounds so that we have less to render for performance

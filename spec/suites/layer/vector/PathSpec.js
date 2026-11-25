@@ -218,7 +218,8 @@ describe('Path', () => {
 
 			it('reprojects paths on a viewreset fired by hand', () => {
 				const path = new Polyline([a, b], {renderer}).addTo(map);
-				const ring = path._rings[0];
+				// a copy: reprojecting moves the ring's points
+				const ring = path._rings[0].map(p => p.clone());
 				renderer._pathOrigin = renderer._pathOrigin.add([10, 0]);
 				path.redraw();
 				expect(path._rings[0]).not.to.eql(ring);
